@@ -63,7 +63,7 @@ def truth_pv_z0(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fast_histo(z0: np.array, pt: np.array, bin_edges: np.array) -> pd.Series:
-    "Event-level Fast Histo implementation to return the reconstructed primary vertex"
+    "DEPRECATED!!!!! (only kept for old results and debugging). Event-level Fast Histo implementation to return the reconstructed primary vertex"
 
     histo = np.histogram(z0, bins=bin_edges, weights=pt)[0]
 
@@ -85,7 +85,7 @@ def run_fast_histo(
     z0_column: str = "trk_z0",
     pt_column: str = "trk_pt",
 ) -> pd.DataFrame:
-    "Runs fast histo on all of the available events"
+    "DEPRECATED!!!!! (only kept for old results and debugging). Runs fast histo on all of the available events"
 
     z0_fast_histo = df.groupby(level=0).apply(
         lambda x: fast_histo(x[z0_column], x[pt_column], bin_edges)
@@ -97,7 +97,7 @@ def run_fast_histo(
 def pv_dbscan(
     z0: np.array, pt: np.array, eps: float, minPts: int, remove_noise: bool = False
 ) -> pd.Series:
-    "Event-level DBSCAN implementation to return the reconstructed primary vertex"
+    "DEPRECATED!!!!! (only kept for old results and debugging). Event-level DBSCAN implementation to return the reconstructed primary vertex"
 
     results = pd.DataFrame({})
 
@@ -126,7 +126,7 @@ def run_dbscan(
     minPts: int = 2,
     remove_noise: bool = False,
 ) -> pd.DataFrame:
-    "run dbscan"
+    """DEPRECATED!!!!! (only kept for old results and debugging). run dbscan"""
 
     z0_dbscan = df.groupby(level=0).apply(
         lambda x: pv_dbscan(x[z0_column], x[pt_column], eps, minPts, remove_noise)
@@ -136,7 +136,9 @@ def run_dbscan(
 
 
 def primary_vertex_efficiency(
-    z0_gen: np.array, z0_reco: np.array, delta: float = 0.1, include_errors: bool = True
+    z0_gen: np.array,
+    z0_reco: np.array,
+    delta: float = 0.1,
 ) -> float:
     "Returns the primary vertex reconstruction efficiency, which is dependent on the resolution (delta)"
 
@@ -180,6 +182,7 @@ def plot_pv_efficiency_z0(
     label: str = "none",
     xlim: list = [-15, 15],
 ) -> dict:
+    """plots the efficiency of the primary vertex as a function of z0"""
 
     n_bins = bin_edges.shape[0] - 1
 
@@ -247,6 +250,7 @@ def plot_pv_resolution_z0(
     delta: float = 0.1,
     label: str = "None",
 ) -> dict:
+    """Plots the resolution of the primary vertex as a function of z0"""
 
     n_bins = bins.shape[0] - 1
     mean_resolution = np.zeros(n_bins)
@@ -309,7 +313,18 @@ def run_pv_fast_histo(
     bin_edges: np.array,
     z0_column: str = "trk_z0",
     pt_column: str = "trk_pt",
-) -> pd.DataFrame:
+) -> np.array:
+    """Runs FastHisto over all of the events.
+
+    Args:
+        df (pd.DataFrame): Dataframe containing multiple events
+        bin_edges (np.array): bin edges to be used for FastHisto
+        z0_column (str, optional): column name containing track's z0 position. Defaults to "trk_z0".
+        pt_column (str, optional): column name containing tracks pt. Defaults to "trk_pt".
+
+    Returns:
+        np.array: Binary labels indicating if the track belongs to the primary vertex.
+    """
     pv_fh = df.groupby(level=0).progress_apply(
         lambda x: fast_histo_event(x[z0_column], x[pt_column], bin_edges)
     )
@@ -324,6 +339,17 @@ def run_pv_fast_histo(
 def pv_dbscan_event(
     z0: pd.Series, pt: pd.Series, eps: float = 0.08, minPts: int = 2
 ) -> pd.Series:
+    """Runs DBSCAN over a signle event. Returns a binary outcome determining if the track belongs to the primary vertex.
+
+    Args:
+        z0 (pd.Series): z0 position of the track
+        pt (pd.Series): pt of the track
+        eps (float, optional): eps hyperparameter. Defaults to 0.08.
+        minPts (int, optional): minPts hyperparameter. Defaults to 2.
+
+    Returns:
+        pd.Series: labels to indicate if track belongs to primary vertex
+    """
 
     _df = pd.DataFrame({})
     _df["z0"] = z0
@@ -335,8 +361,10 @@ def pv_dbscan_event(
 
     _df["db_label"] = db_clustering.labels_
 
+    # -1 labels correspond to noise points, so floor these to 0 pt so they never become the PV.
     _df.loc[_df["db_label"] == -1, "pt"] = 0
 
+    # Determine which DBSCAN label corresponds to the primary vertex.
     pv_label = (
         _df.groupby(["db_label"])["pt"].sum().sort_values(ascending=False).index[0]
     )
@@ -354,7 +382,20 @@ def run_pv_dbscan(
     pt_column: str = "trk_pt",
     eps: float = 0.08,
     minPts: int = 2,
-) -> pd.DataFrame:
+) -> np.array:
+    """Runs DBSCAN over the whole dataset (multiple events).
+    The algorithm will predict for each track in the event whether it belongs to the PV or not.
+
+    Args:
+        df (pd.DataFrame): dataframe containing trk z0 and pt information for dbscan to use
+        z0_column (str, optional): column of the dataframe where the z0 information is stored. Defaults to "trk_z0".
+        pt_column (str, optional): column of the dataframe where the pt information is stored. Defaults to "trk_pt".
+        eps (float, optional): eps hyperparameter of DBSCAN. Defaults to 0.08.
+        minPts (int, optional): minPts hyperparameter of DBSCAN. Defaults to 2.
+
+    Returns:
+        np.array: Array containing the predicted labels by DBSCAN
+    """
 
     pv_dbscan = df.groupby(level=0).progress_apply(
         lambda x: pv_dbscan_event(x[z0_column], x[pt_column], eps, minPts)
@@ -366,6 +407,16 @@ def run_pv_dbscan(
 def pv_z0_reco(
     df: pd.DataFrame, reco_label: str = "fh_label", z0_label: str = "trk_z0"
 ) -> pd.DataFrame:
+    """Returns the z0 of the primary vertex for a given reconstruction algorithm (fasthisto or dbscan)
+
+    Args:
+        df (pd.DataFrame): dataframe containing the labels of the reconstruction algorithm and the trk z0
+        reco_label (str, optional): column of the dataframe containing the labels. Defaults to "fh_label".
+        z0_label (str, optional): column of the dataframe that containes the z0 information. Defaults to "trk_z0".
+
+    Returns:
+        pd.DataFrame: Dataframe containing the reconstructed PV z0 for each event
+    """
 
     return (
         df.loc[df[reco_label] == 1].groupby(["entry"])[z0_label].median().reset_index()
@@ -375,6 +426,16 @@ def pv_z0_reco(
 def trk_vertex_association(
     df: pd.DataFrame, true_label: str = "trk_fake", pred_label: str = "fh_label"
 ) -> dict:
+    """Calculates Binary Classification metrics
+
+    Args:
+        df (pd.DataFrame): dataframe containing true and predicted labels
+        true_label (str, optional): column name of true label. Defaults to "trk_fake".
+        pred_label (str, optional): column name of predicted labels. Defaults to "fh_label".
+
+    Returns:
+        dict: classification metrics
+    """
 
     tn, fp, fn, tp = confusion_matrix(
         df[true_label].values, df[pred_label].values
