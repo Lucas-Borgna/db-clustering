@@ -295,12 +295,21 @@ def fast_histo_event(z0: np.array, pt: np.array, bin_edges: np.array) -> pd.Seri
 
     histo = np.histogram(z0, bins=bin_edges, weights=pt)[0]
 
+    histo_c = np.convolve(histo, [1, 1, 1], mode="same")
+
     labels = np.zeros(len(z0), dtype=int)
 
     max_idx = np.argmax(histo)
+    max_idx_c = np.argmax(histo_c)
 
-    lower_bin_bound = bin_edges[max_idx]
-    upper_bin_bound = bin_edges[max_idx + 1]
+    lower_bin_bound = bin_edges[max_idx_c]
+    upper_bin_bound = bin_edges[max_idx_c + 1]
+
+    global max_idx_list
+    global max_idx_list_c
+    max_idx_list.append(max_idx)
+    max_idx_list_c.append(max_idx_c)
+
 
     in_max_bin_mask = (z0 > lower_bin_bound) & (z0 <= upper_bin_bound)
     labels[in_max_bin_mask] = 1
