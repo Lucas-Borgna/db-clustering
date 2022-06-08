@@ -21,7 +21,7 @@ if int(uproot.__version__[0]) < 4:
 
 
 def res_function(eta):
-    res = 0.1 + 0.2 * eta ** 2
+    res = 0.1 + 0.2 * eta**2
     return res
 
 
@@ -309,7 +309,6 @@ def fast_histo_event(z0: np.array, pt: np.array, bin_edges: np.array) -> pd.Seri
     global max_idx_list_c
     max_idx_list.append(max_idx)
     max_idx_list_c.append(max_idx_c)
-
 
     in_max_bin_mask = (z0 > lower_bin_bound) & (z0 <= upper_bin_bound)
     labels[in_max_bin_mask] = 1
