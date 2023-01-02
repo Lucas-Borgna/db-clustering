@@ -1,12 +1,15 @@
+from heapq import merge
+from os import POSIX_FADV_SEQUENTIAL
+from sysconfig import get_python_version
+from typing import final
 import numpy as np
 import pandas as pd
 import math
 
-# Merging of clusters
-# https://stackoverflow.com/questions/325933/determine-whether-two-date-ranges-overlap/325964#325964
+from pyrsistent import b
 
 
-class BatchedDBSCANV2:
+class BatchedDBSCAN:
     def __init__(
         self, z0, pt, eps, batch_size, max_number_of_tracks, verbose: bool = False
     ):
@@ -120,16 +123,24 @@ class BatchedDBSCANV2:
 
         for i in range(max_tracks - 1):
 
-            check1 = left_boundaries[i] and not (left_boundaries[i + 1])
-            check2 = not (left_boundaries[i]) and left_boundaries[i + 1]
+            left_edge = left_boundaries[i] and not (left_boundaries[i + 1])
+            right_edge = not (left_boundaries[i]) and left_boundaries[i + 1]
+            check_noise = (left_boundaries[i] == 1) and (left_boundaries[i + 1] == 1)
 
-            if check1 or check2:
+            if left_edge or right_edge:
                 boundaries[i][0] = i
                 boundaries[i][1] = rs[i]
                 boundaries[i][2] = rs[i + 1]
                 boundaries[i][3] = rs[i + 1] - rs[i]
                 boundaries[i][4] = tracks[i, 0]
                 boundaries[i][5] = tracks[i + 1, 0]
+            elif check_noise:
+                boundaries[i][0] = i
+                boundaries[i][1] = rs[i]
+                boundaries[i][2] = rs[i + 1]
+                boundaries[i][3] = rs[i + 1] - rs[i]
+                boundaries[i][4] = tracks[i, 0]
+                boundaries[i][5] = tracks[i, 0]
             else:
                 boundaries[i][0] = max_tracks
                 boundaries[i][1] = 0
@@ -164,20 +175,37 @@ class BatchedDBSCANV2:
 
     def convert_boundaries_to_clusters(self, boundaries: np.array) -> np.array:
         n_boundaries = boundaries.shape[0]
-        n_clusters = math.ceil(n_boundaries / 2)
-        clusters = np.zeros((n_clusters, 6))
+        n_clusters = math.ceil(n_boundaries / 2)  # minPts = 2
+        clusters = np.zeros((n_boundaries, 7))
         j = 0
-        for i in range(0, n_boundaries, 2):
-            pt_low = boundaries[i, 1]
-            pt_high = boundaries[i + 1, 2]
-            pt_sum = pt_high - pt_low
-            z0_low = boundaries[i, 4]
-            z0_high = boundaries[i + 1, 5]
+        i = 0
 
-            clusters[j, 3] = pt_sum
-            clusters[j, 4] = z0_low
-            clusters[j, 5] = z0_high
-            j += 1
+        while i < n_boundaries:
+            check_noise = boundaries[i, -1] == 1
+            if check_noise:
+                pt_low = boundaries[i, 1]
+                pt_high = boundaries[i, 2]
+                pt_sum = pt_high - pt_low
+                z0_low = boundaries[i, 4]
+                z0_high = boundaries[i, 5]
+
+                clusters[j, 3] = pt_sum
+                clusters[j, 4] = z0_low
+                clusters[j, 5] = z0_high
+                clusters[j, 6] = 1
+                j += 1
+                i += 1
+            else:
+                pt_low = boundaries[i, 1]
+                pt_high = boundaries[i + 1, 2]
+                pt_sum = pt_high - pt_low
+                z0_low = boundaries[i, 4]
+                z0_high = boundaries[i + 1, 4]
+                clusters[j, 3] = pt_sum
+                clusters[j, 4] = z0_low
+                clusters[j, 5] = z0_high
+                j += 1
+                i += 2
         return clusters
 
     def get_vertex(self, cluster_of_tracks: np.array) -> float:
@@ -206,19 +234,12 @@ class BatchedDBSCANV2:
         self.z0 = self.pad_vector(self.z0, n_pad, 21)
         self.pt = self.pad_vector(self.pt, n_pad, 0)
 
-        max_rs = 0
-
         clusters = np.zeros((self.max_n_clusters, 6))
 
-        self.max_pt = 0
-        self.max_pt_i = 0
-        self.merge_count = 0
-
         pv_cluster = np.zeros((1, 6))
-
+        merge_count = 0
         for i in range(self.n_batches):
 
-            # print(f"----------------- {i} --------------")
             start_idx = i * self.batch_size
             end_idx = (i + 1) * self.batch_size
 
@@ -238,30 +259,66 @@ class BatchedDBSCANV2:
             boundaries = self.find_right_boundaries(
                 left_boundaries, rs_batch, track_batch
             )
+
             clusters_batch = self.convert_boundaries_to_clusters(boundaries)
 
-            # Add batch to current list of clusters
             clusters[
-                i * self.max_n_clusters_batch : (i + 1) * self.max_n_clusters_batch,
-                :,
+                i * self.max_n_clusters_batch : (i + 1) * self.max_n_clusters_batch, :
             ] = clusters_batch
 
-            # Perform the merging of the clusters with the previously found clusters
-            if i >= 1:
-                clusters = self.merge_clusters(clusters)
-
-            # Stop if we've reached the maximum
             if track_batch[-1, 0] == 21:
                 break
 
+        # Merge clusters
+        if self.n_batches > 1:
+            max_pt = 0
+            max_pt_i = 0
+            merge_count = 0
+            for i in range(clusters.shape[0]):
+                if clusters[i, 4] >= 21:
+                    continue
+
+                if max_pt < clusters[i, 3]:
+                    max_pt = clusters[i, 3]
+                    max_pt_i = i
+                for j in range(clusters.shape[0]):
+
+                    if clusters[j, 4] >= 21:
+                        continue
+
+                    if i >= j:
+                        continue
+
+                    case1 = (clusters[i, 4] - self.eps) <= clusters[j, 5]
+                    case2 = (clusters[i, 5] + self.eps) >= clusters[j, 4]
+
+                    if case1 and case2:
+                        # print("merging")
+                        merge_count += 1
+
+                        # Expand boundaries of cluster after merging
+                        if clusters[j, 4] < clusters[i, 4]:
+                            clusters[i, 4] = clusters[j, 4]
+                        if clusters[j, 5] > clusters[i, 5]:
+                            clusters[i, 5] = clusters[j, 5]
+                        clusters[i, 3] += clusters[j, 3]
+                        if max_pt < clusters[i, 3]:
+                            max_pt = clusters[i, 3]
+                            max_pt_i = i
+
+                        # Delete the cluster after merging
+                        clusters[j, 3] = 0
+                        clusters[j, 4] = 21
+                        clusters[j, 5] = 21
+
+        if self.n_batches == 1:
+            max_pt_i = np.argmax(clusters[:, 3])
+            max_pt = clusters[max_pt_i, 3]
+
         # Find pv_cluster
-        pv_cluster[0, :] = clusters[self.max_pt_i, :]
-        # print("---------clusters---------")
-        # print(clusters)
-        # np.save("clusters.npy", clusters)
-        print(self.max_pt, self.max_pt_i)
-        # print(pv_cluster)
-        print(f"Merged count: {self.merge_count}")
+        pv_cluster[0, :] = clusters[max_pt_i, :]
+        print(max_pt, max_pt_i)
+        print(f"Merged count: {merge_count}")
 
         pv_tracks = []
 
@@ -276,63 +333,3 @@ class BatchedDBSCANV2:
         print(f"mean: {np.mean(pv_tracks)}")
         print(f"median: {np.median(pv_tracks)}")
         print(f"median2: {median_vertex}")
-
-    def merge_clusters(self, clusters: np.array) -> np.array:
-
-        n_clusters = clusters.shape[0]
-        pt_idx = 3
-        z0_min = 4
-        z0_max = 5
-
-        for i in range(n_clusters):
-
-            c_i = clusters[i, :]
-
-            # skip if we've reached the end of the clusters
-            if c_i[z0_min] >= 21:
-                continue
-
-            cluster_pt = c_i[pt_idx]
-            if self.max_pt < cluster_pt:
-                self.max_pt = cluster_pt
-                self.max_pt_i = i
-
-            for j in range(n_clusters):
-                if i >= j:
-                    continue
-                c_j = clusters[j, :]
-
-                # Skip if we've reached the end of the clusters
-                if c_j[z0_min] >= 21:
-                    continue
-
-                # left_overlap (c_j, before c_i)
-                left_overlap = (c_i[z0_min] - self.eps) <= c_j[z0_max]
-
-                # right_overlap (c_i befrore c_j)
-                right_overlap = (c_i[z0_max] + self.eps) >= c_j[z0_min]
-
-                # Merge if both conditions are true
-                merge = left_overlap and right_overlap
-
-                if merge:
-                    self.merge_count += 1
-
-                    # Expand cluster boundaries if necessary
-                    if c_j[z0_min] < c_i[z0_min]:
-                        clusters[i, z0_min] = c_j[z0_min]
-                    if c_j[z0_max] > c_i[z0_max]:
-                        clusters[i, z0_max] = c_j[z0_max]
-                    # Add pT to existing cluster
-                    clusters[i, pt_idx] += clusters[j, pt_idx]
-
-                    # Check if max_pt is greater than before
-                    if self.max_pt < clusters[i, pt_idx]:
-                        self.max_pt = clusters[i, pt_idx]
-                        self.max_pt_i = i
-
-                    # Delete cluster post merging
-                    clusters[j, pt_idx] = 0
-                    clusters[j, z0_min] = 21
-                    clusters[j, z0_max] = 21
-            return clusters

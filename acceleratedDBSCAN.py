@@ -4,40 +4,49 @@ import math
 
 
 class AccDBSCAN:
-    def __init__(self, z0, pt, eps, max_number_of_tracks, verbose: bool = False):
+    def __init__(self, z0, pt, eps, max_number_of_tracks, verbose: bool = False, debug:bool = False):
         self.z0 = z0
         self.pt = pt
         self.eps = eps
         self.verbose = verbose
+        self.debug = debug
         self.n_tracks = z0.shape[0]
-        self.rs = pt  # variable to contain the sum of pt
+        # self.rs = pt  # variable to contain the sum of pt
         self.max_number_of_tracks = int(max_number_of_tracks)
         self.max_number_of_tracks_power_2 = 1 << (max_number_of_tracks - 1).bit_length()
         self.max_number_of_tracks_log_2 = np.log2(self.max_number_of_tracks_power_2)
 
-    def add_padding(self):
-        """pads array to match the maximum number of tracks"""
+#     def add_padding(self):
+#         """pads array to match the maximum number of tracks"""
 
-        n_pad = self.max_number_of_tracks - self.n_tracks
+#         n_pad = self.max_number_of_tracks - self.n_tracks
 
-        # 21 cm is like out of bounds of the tracker
-        to_pad_z0 = 21 * np.ones(n_pad)
-        self.z0 = np.append(self.z0, to_pad_z0)
+#         # 21 cm is like out of bounds of the tracker
+#         to_pad_z0 = 21 * np.ones(n_pad)
+#         self.z0 = np.append(self.z0, to_pad_z0)
 
-        # 0 GeV padding for pT
-        to_pad_pt = np.zeros(n_pad)
-        self.pt = np.append(self.pt, to_pad_pt)
+#         # 0 GeV padding for pT
+#         to_pad_pt = np.zeros(n_pad)
+#         self.pt = np.append(self.pt, to_pad_pt)
 
-        # 0 GeV padding to nearesr power of 2 for prefix sum of pT
-        n_pad_rs = self.max_number_of_tracks_power_2 - self.n_tracks
-        to_pad_rs = np.zeros(n_pad_rs)
-        self.rs = np.append(self.rs, to_pad_rs)
+#         # 0 GeV padding to nearesr power of 2 for prefix sum of pT
+#         n_pad_rs = self.max_number_of_tracks_power_2 - self.n_tracks
+#         to_pad_rs = np.zeros(n_pad_rs)
+#         self.rs = np.append(self.rs, to_pad_rs)
 
     def build_tracks(self):
         """
         builds tracks by putting together the [z0, pt, label] information.
         labels are initialized to 0 first
         """
+        
+        # add padding
+        n_pad = self.max_number_of_tracks - self.n_tracks
+        to_pad_z0 = 21 * np.ones(n_pad)
+        to_pad_pt = np.zeros(n_pad)
+        self.z0 = np.append(self.z0, to_pad_z0)
+        self.pt = np.append(self.pt, to_pad_pt)
+        
         self.tracks = np.zeros((self.max_number_of_tracks, 3))
 
         self.tracks[:, 0] = self.z0
@@ -45,19 +54,31 @@ class AccDBSCAN:
 
         # sort the tracks by z0
         self.tracks = self.tracks[self.tracks[:, 0].argsort()]
+        
+        self.rs = self.tracks[:, 1]
+        n_pad_rs = self.max_number_of_tracks_power_2 - self.max_number_of_tracks
+        to_pad_rs = np.zeros(n_pad_rs)
+        self.rs = np.append(self.rs, to_pad_rs)
+                
 
     def initialize_data(self):
-
-        # pad z0 and pt
-        self.add_padding()
-        if self.verbose:
-            print("data padded")
-
+        
         # build tracks
         self.build_tracks()
         if self.verbose:
             print("tracks built")
+            print(self.tracks.shape)
+            print(self.rs.shape)
+        
+        # # pad z0 and pt
+        # self.add_padding()
+        # if self.verbose:
+        #     print("data padded")
 
+
+        if self.debug:
+            rs2 = np.cumsum(self.rs)
+            pd.DataFrame(rs2, columns=['pt_sum']).to_csv('rs2.csv')
         self.prefix_sum()
         if self.verbose:
             print("prefix sum done")
@@ -70,6 +91,10 @@ class AccDBSCAN:
             print("data initialized...")
             np.save("rs.npy", self.rs)
             np.save("pt.npy", self.pt)
+            np.save("tracks.npy", self.tracks)
+        if self.debug:
+            pd.DataFrame(self.rs).to_csv("rs.csv")
+            pd.DataFrame(self.tracks, columns=["z0","pt","label"]).to_csv("input_tracks.csv")
 
         # find left boundaries
         self.find_left_boundaries()
@@ -87,6 +112,8 @@ class AccDBSCAN:
         self.find_vertices()
         if self.verbose:
             print("vertices found...")
+        if self.debug:
+            pd.DataFrame(self.vertices, columns = ["z0","pt_sum"]).to_csv("vertices.csv")
 
         # record z0 of primary vertex
         self.pv_z0 = self.vertices[0][0]
@@ -111,6 +138,9 @@ class AccDBSCAN:
                 left_boundaries[i] = 0
 
         self.left_boundaries = left_boundaries
+        
+        if self.debug:
+            pd.DataFrame(left_boundaries, columns=["bound"]).to_csv("left_boundaries.csv")
 
     def find_right_boundaries(self):
 
@@ -150,6 +180,9 @@ class AccDBSCAN:
             boundaries[max_tracks - 1][0] = max_tracks - 1
             boundaries[max_tracks - 1][1] = self.rs[max_tracks - 1]
             boundaries[max_tracks - 1][2] = self.rs[max_tracks]
+            
+        if self.debug:
+            pd.DataFrame(boundaries, columns = ["idx","pts","nextPts","diff","z0_min","z0_max"]).to_csv("boundaries.csv")
 
         # Sort boundaries by the index
         boundaries = boundaries[boundaries[:, 0].argsort()]
@@ -217,7 +250,7 @@ class AccDBSCAN:
         """
 
         n_size = cluster_of_tracks.shape[0]
-
+        
         if n_size % 2 == 0:
             return 0.5 * (
                 cluster_of_tracks[n_size // 2][0]
