@@ -26,38 +26,28 @@ class BatchedDBSCAN:
         self.batch_size = batch_size
         self.max_number_of_tracks = int(max_number_of_tracks)
         self.n_batches = math.ceil(self.max_number_of_tracks / self.batch_size)
+        self.max_n_tracks_batched = self.batch_size * self.n_batches
         self.top_pt_n = top_pt_n
+        self.max_n_clusters = self.top_pt_n * self.n_batches
         self.fh_nbins = fh_nbins
 
-        # Max number of tracks including all batches
-        self.max_n_tracks_batched = self.batch_size * self.n_batches
-        self.max_n_clusters_batch = math.ceil(self.batch_size / self.minPts)  #
-        self.max_n_clusters = math.ceil(self.max_n_tracks_batched / self.minPts)
-
         # need to pad vectors to have the fixed size
-        n_pad = self.max_number_of_tracks - z0.shape[0]
+        n_pad = self.max_n_tracks_batched - z0.shape[0]
         self.z0 = self.pad_vector(z0, n_pad, self.z0_boundary)
         self.pt = self.pad_vector(pt, n_pad, self.pt_boundary)
 
         # Prefix sum variables
-        self.max_number_of_tracks_power_2 = (
-            1 << (self.max_number_of_tracks - 1).bit_length()
-        )
-        self.batch_size_power_2 = 1 << (self.batch_size - 1).bit_length()
-        self.max_number_of_tracks_log_2 = np.log2(self.max_number_of_tracks_power_2)
-        self.batch_size_log_2 = np.log2(self.batch_size_power_2)
-
-        # Dictionaries for recording the results
-        self.results = {}
-        self.results_sklearn = {}
-        self.merged_list = []
+        self.ntracks_batch_power_2 = 1 << (self.top_pt_n - 1).bit_length()
+        self.ntracks_batch_log_2 = np.log2(self.ntracks_batch_power_2)
 
         # Cluster array indices
-        # pT, z0_low, z0_high, Noise
+        # pT, z0_low, z0_high, Noise, fxs, Ns
         self.pt_idx = 0
         self.z0_low_idx = 1
         self.z0_high_idx = 2
         self.noise_idx = 3
+        self.fxs_idx = 4
+        self.Ns_idx = 5
 
     def pad_vector(self, vec: np.array, n_pad: int, value: int) -> np.array:
         """Pads input vector with n_pad entries that have a specific value
@@ -169,7 +159,6 @@ class BatchedDBSCAN:
         # boundaries data type:
         # [index, pt_sum(i),pt_sum(i+1), pt_sum(i+1)-pt_sum(i),z0_low,z0_high, noise]
         boundaries = np.zeros((max_tracks, 7))
-        # is_noise = np.ones((max_tracks))
         # boundaries begin as noise by default
         boundaries[:, 6] = np.ones(max_tracks)
 
@@ -240,15 +229,36 @@ class BatchedDBSCAN:
         return boundaries
 
     def initialize_clusters(self, max_n_clusters: int) -> np.array:
+        """Initializes an array of clusters.
+        a cluster is represented by 6 entries:
+        [z0_low, z0_high, pt_sum, noise, fxs, Ns]
 
-        clusters = np.zeros((max_n_clusters, 4))
+        Args:
+            max_n_clusters (int): How many clusters to initialize
+
+        Returns:
+            np.array: clusters array with correct intialization
+        """
+
+        clusters = np.zeros((max_n_clusters, 6))
 
         clusters[:, self.z0_low_idx] = 21
         clusters[:, self.z0_high_idx] = 21
 
         return clusters
 
-    def convert_boundaries_to_clusters(self, boundaries: np.array):
+    def convert_boundaries_to_clusters(
+        self, boundaries: np.array, tracks_batch: np.array
+    ) -> np.array:
+        """Converts the array of boundaries to their clusters.
+
+        Args:
+            boundaries (np.array): array of the clusters boundaries sorted by index
+            tracks_batch (np.array): array containing the tracks that created the boundaries
+
+        Returns:
+            np.array: array with the clusters
+        """
         bound_i = 0
         cluster_j = 0
         n_boundaries = boundaries.shape[0]
@@ -272,8 +282,9 @@ class BatchedDBSCAN:
 
                 x = z0_low  # Since its noise, the x is the same as z0_low or z0_high
                 h = pt_sum  # Since its noise, the histo is just the pt of the noise point
-                self.fxs[(self.batch_number * self.batch_size) + cluster_j] = x * h
-                self.Ns[(self.batch_number * self.batch_size) + cluster_j] = h
+
+                clusters[cluster_j, self.fxs_idx] = x * h
+                clusters[cluster_j, self.Ns_idx] = h
 
                 bound_i += 1
                 cluster_j += 1
@@ -295,15 +306,13 @@ class BatchedDBSCAN:
                 f_batch_mask[int(idx) : int(idx_next)] = 1
 
                 h = np.histogram(
-                    self.z0_batches[self.batch_number],
+                    tracks_batch[:, 0],
                     bin_edges,
-                    weights=self.pt_batches[self.batch_number] * f_batch_mask,
+                    weights=tracks_batch[:, 1] * f_batch_mask,
                 )[0]
 
-                self.fxs[(self.batch_number * self.top_pt_n) + cluster_j] = np.sum(
-                    x * h
-                )
-                self.Ns[(self.batch_number * self.top_pt_n) + cluster_j] = np.sum(h)
+                clusters[cluster_j, self.fxs_idx] = np.sum(x * h)
+                clusters[cluster_j, self.Ns_idx] = np.sum(h)
 
                 bound_i += 2
                 cluster_j += 1
@@ -331,99 +340,88 @@ class BatchedDBSCAN:
         return overlap
 
     def merge_clusters(self, c: np.array) -> np.array:
+        """Merges the input clusters if they overlap.
+        Through the merging procedure, the primary vertex is determined.
+
+        Args:
+            c (np.array): input unmerged clusters
+
+        Returns:
+            np.array: output merged clusters
+        """
 
         clusters = c.copy()
 
         n_clusters = clusters.shape[0]
-        if self.n_batches == 1:
-            self.max_pt_i = np.argmax(clusters[:, self.pt_idx])
-            self.max_pt = clusters[self.max_pt_i, self.pt_idx]
-            return clusters
 
-        else:
-            max_pt = 0
-            max_pt_i = 0
+        self.max_pt = 0
+        self.max_pt_i = 0
 
-            comb = list(itertools.combinations(range(n_clusters), 2))
-            self.comb = comb
+        comb = list(itertools.combinations(range(n_clusters), 2))
+        self.comb = comb
 
-            to_merge = 9 * np.ones((n_clusters, n_clusters))
+        for i, j in comb:
 
-            for i, j in comb:
+            # skip if cluster  is outside detector
+            if (clusters[i, self.z0_low_idx] >= 21) or (
+                clusters[j, self.z0_low_idx] >= 21
+            ):
+                continue
 
-                # skip if cluster  is outside detector
-                if (clusters[i, self.z0_low_idx] >= 21) or (
-                    clusters[j, self.z0_low_idx] >= 21
-                ):
-                    continue
+            overlap = self.clusters_overlap(clusters[i, :], clusters[j, :])
+            if overlap:
 
-                ci = copy.copy(clusters[i, :])
-                cj = copy.copy(clusters[j, :])
+                # If cluster j is noise, then upon merging it is no-longer noise
+                cj_noise = clusters[j, self.noise_idx]
 
-                overlap = self.clusters_overlap(clusters[i, :], clusters[j, :])
-                to_merge[i, j] = overlap
-                if overlap:
+                if cj_noise:
+                    clusters[j, self.noise_idx] = 0
 
-                    # If cluster j is noise, then upon merging it is no-longer noise
-                    cj_noise = clusters[j, self.noise_idx]
+                # Expand boundaries of cluster after merging
+                if clusters[i, self.z0_low_idx] < clusters[j, self.z0_low_idx]:
+                    clusters[j, self.z0_low_idx] = clusters[i, self.z0_low_idx]
+                if clusters[i, self.z0_high_idx] > clusters[j, self.z0_high_idx]:
+                    clusters[j, self.z0_high_idx] = clusters[i, self.z0_high_idx]
 
-                    if cj_noise:
-                        clusters[j, self.noise_idx] = 0
+                # Add the pT of the cluster being merged.
+                clusters[j, self.pt_idx] += clusters[i, self.pt_idx]
 
-                    # Expand boundaries of cluster after merging
-                    if clusters[i, self.z0_low_idx] < clusters[j, self.z0_low_idx]:
-                        clusters[j, self.z0_low_idx] = clusters[i, self.z0_low_idx]
-                    if clusters[i, self.z0_high_idx] > clusters[j, self.z0_high_idx]:
-                        clusters[j, self.z0_high_idx] = clusters[i, self.z0_high_idx]
+                # Adds the numerator and denominator for the weighted mean
+                clusters[j, self.fxs_idx] += clusters[i, self.fxs_idx]
+                clusters[j, self.Ns_idx] += clusters[i, self.Ns_idx]
 
-                    # Add the pT of the cluster being merged.
-                    clusters[j, self.pt_idx] += clusters[i, self.pt_idx]
+                # Erase merged cluster.
+                clusters[i, self.pt_idx] = 0
+                clusters[i, self.z0_low_idx] = 21
+                clusters[i, self.z0_high_idx] = 21
+                clusters[i, self.noise_idx] = 0
+                clusters[i, self.fxs_idx] = 0
+                clusters[i, self.Ns_idx] = 0
 
-                    self.fxs[j] += self.fxs[i]
-                    self.Ns[j] += self.Ns[i]
+            # check if the pT_sum max is now higher
+            # Need to protect against selecting a noise point as PV
+            if (self.max_pt < clusters[j, self.pt_idx]) and (
+                clusters[j, self.noise_idx] != 1
+            ):
+                self.max_pt = clusters[j, self.pt_idx]
+                self.max_pt_i = j
 
-                    # Erase merged cluster.
-                    clusters[i, self.pt_idx] = 0
-                    clusters[i, self.z0_low_idx] = 21
-                    clusters[i, self.z0_high_idx] = 21
-                    clusters[i, self.noise_idx] = 0
-
-                # check if the pT_sum max is now higher
-                # Need to protect against selecting a noise point as PV
-                if (max_pt < clusters[j, self.pt_idx]) and (
-                    clusters[j, self.noise_idx] != 1
-                ):
-                    max_pt = clusters[j, self.pt_idx]
-                    max_pt_i = j
-            self.to_merge = pd.DataFrame(to_merge)
-            self.max_pt = max_pt
-            self.max_pt_i = max_pt_i
-
-            return pd.DataFrame(
-                clusters, columns=["pt_sum", "z0_low", "z0_high", "noise"]
-            )
+        return clusters
 
     def fit(self):
+        """Function fits the Batched DBSCAN algorithm to the input data and with the predetermined configuration.
+        Function calculates the z0 position of the primary vertex by using a weighted mean calculation.
+        """
 
         start_idx = 0
         end_idx = start_idx + self.batch_size
-        # Need to pad vectors to match the size of n_batches*batch_size
-        n_pad = (self.n_batches * self.batch_size) - self.z0.shape[0]
-        self.z0 = self.pad_vector(self.z0, n_pad, 21)
-        self.pt = self.pad_vector(self.pt, n_pad, 0)
 
-        clusters = self.initialize_clusters(self.top_pt_n * self.n_batches)
-
-        self.z0_batches = {}
-        self.pt_batches = {}
-
-        self.fxs = np.zeros(self.max_n_tracks_batched)
-        self.Ns = np.zeros(self.max_n_tracks_batched)
+        # Total (maximum) number of clusters = n_batches * top_pt_n (eg. 5 * 10 = 50)
+        clusters = self.initialize_clusters(self.max_n_clusters)
 
         for i in range(self.n_batches):
             start_idx = i * self.batch_size
             end_idx = (i + 1) * self.batch_size
-            self.batch_number = i
 
             z0_batch = self.z0[start_idx:end_idx]
             pt_batch = self.pt[start_idx:end_idx]
@@ -434,35 +432,37 @@ class BatchedDBSCAN:
             z0_batch = z0_batch[: self.top_pt_n]
             pt_batch = pt_batch[: self.top_pt_n]
 
-            track_batch = self.build_tracks(z0_batch, pt_batch)
-            self.tracks = track_batch
+            tracks_batch = self.build_tracks(z0_batch, pt_batch)
+            self.tracks = tracks_batch
 
             rs_batch = self.pad_vector(
-                track_batch[:, 1], self.batch_size_power_2 - track_batch.shape[0], 0
+                tracks_batch[:, 1],
+                self.ntracks_batch_power_2 - self.top_pt_n,
+                self.pt_boundary,
             )
 
             rs_batch = self.prefix_sum(rs_batch)
-            self.rs = rs_batch
-
-            # Storing batches
-            self.z0_batches[i] = track_batch[:, 0]
-            self.pt_batches[i] = track_batch[:, 1]
 
             # Finding Left Boundaries
-            left_boundaries = self.find_left_boundaries(track_batch)
+            left_boundaries = self.find_left_boundaries(tracks_batch)
 
             # Finding Right Boundaries
-            boundaries = self.find_boundaries(left_boundaries, rs_batch, track_batch)
+            boundaries = self.find_boundaries(left_boundaries, rs_batch, tracks_batch)
 
-            self.boundaries = boundaries
-            clusters_batch = self.convert_boundaries_to_clusters(boundaries)
+            clusters_batch = self.convert_boundaries_to_clusters(
+                boundaries, tracks_batch
+            )
 
             clusters[i * self.top_pt_n : (i + 1) * self.top_pt_n, :] = clusters_batch
 
-            self.results[i] = clusters_batch
+        # Merge clusters only if there's more than one batch
+        if self.n_batches > 1:
+            self.clusters = self.merge_clusters(clusters)
+        else:
+            self.max_pt_i = np.argmax(clusters[:, self.pt_idx])
+            self.max_pt = clusters[self.max_pt_i, self.pt_idx]
 
-        clusters = self.merge_clusters(clusters)
-
-        self.clusters = clusters
-
-        self.z0_pv_wm = self.fxs[self.max_pt_i] / self.Ns[self.max_pt_i]
+        self.z0_pv_wm = (
+            self.clusters[self.max_pt_i, self.fxs_idx]
+            / self.clusters[self.max_pt_i, self.Ns_idx]
+        )
